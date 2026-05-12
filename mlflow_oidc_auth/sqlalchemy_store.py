@@ -1251,15 +1251,24 @@ _PERMISSION_CUD_METHODS = [
 
 
 def _wrap_with_cache_flush(method):
-    """Wrap a store method to flush the permission cache after successful execution."""
+    """Wrap a store method to flush the permission caches after successful execution.
+
+    Both the 'permissions' cache (resource-level resolution results) and the
+    new 'user_context' cache (per-user pre-fetched permission context, added
+    in quick task 260512-o78) are flushed. The wrapper doesn't know which
+    user is affected, so it flushes both caches in full (TTL=30s bounds the
+    blast window).
+    """
 
     @functools.wraps(method)
     def wrapper(self, *args, **kwargs):
         result = method(self, *args, **kwargs)
-        # Lazy import to avoid circular dependency at module load time
+        # Lazy import to avoid circular dependency at module load time.
+        from mlflow_oidc_auth.utils.batch_permissions import flush_user_context_cache
         from mlflow_oidc_auth.utils.permissions import flush_permission_cache
 
         flush_permission_cache()
+        flush_user_context_cache()
         return result
 
     return wrapper

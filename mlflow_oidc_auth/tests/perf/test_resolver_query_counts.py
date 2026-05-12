@@ -2,9 +2,9 @@
 
 These tests pin EXACT query counts for the permission-resolution hot path:
 ``build_user_permission_context``, the experiment-group resolver, and the
-workspace cache cold/warm lookup paths. They start as a baseline lock
-(captured at the post-Task-1 commit on 2026-05-12) and are updated in
-Task 6 to assert the post-optimization numbers.
+workspace cache cold/warm lookup paths. Numbers below were captured at
+post-Task-5 (commit 06e458d on branch perf/resolver-context-caching,
+2026-05-12) with one user in 3 groups against an in-memory SQLite store.
 
 Why exact-equality (not ``<=``)? Because a silent improvement is just as
 interesting to know about as a regression - we want both to fail loud so
@@ -53,12 +53,29 @@ def workspaces_enabled() -> Iterator[None]:
         config.PERMISSION_SOURCE_ORDER = orig_order
 
 
-def test_build_user_permission_context_query_count(alice_with_three_groups: SqlAlchemyStore, query_counter: QueryCounter):
-    """Lock in current query count for ``build_user_permission_context``.
+@pytest.fixture
+def reset_user_context_cache() -> Iterator[None]:
+    """Reset the per-test user_context cache backend so each test starts cold."""
+    from mlflow_oidc_auth.utils import batch_permissions, workspace_cache
 
-    baseline 2026-05-12 @ f3ac331 — see quick task 260512-o78
+    batch_permissions._user_context_cache = None
+    workspace_cache._cache = None
+    yield
+    batch_permissions._user_context_cache = None
+    workspace_cache._cache = None
+
+
+def test_build_user_permission_context_query_count(
+    alice_with_three_groups: SqlAlchemyStore,
+    query_counter: QueryCounter,
+):
+    """Query count for ``build_user_permission_context`` with workspaces OFF.
+
+    No change vs. baseline because workspaces are off and the workspace
+    branch is skipped entirely. See quick task 260512-o78.
+
+    was 21, now 21 — workspaces disabled in this test
     """
-    # Point the module-level ``store`` singleton at our per-test store.
     with patch("mlflow_oidc_auth.utils.batch_permissions.store", alice_with_three_groups):
         from mlflow_oidc_auth.utils.batch_permissions import build_user_permission_context
 
@@ -66,20 +83,20 @@ def test_build_user_permission_context_query_count(alice_with_three_groups: SqlA
         ctx = build_user_permission_context("alice")
 
     assert ctx.username == "alice"
-    # baseline 2026-05-12 @ f3ac331 — see quick task 260512-o78
-    # Today's shape: 1 get_groups_ids + 1 list_experiment_perms (each goes
-    # through get_user inside the repo = 2 queries each in many cases, then
-    # the resolver re-fetches user_groups inside list_user_groups_*).
+    # was 21, now 21 (workspaces off, no behavior change) — quick task 260512-o78
     assert query_counter.total == 21
 
 
-def test_get_group_permission_for_user_experiment_query_count(alice_with_three_groups: SqlAlchemyStore, query_counter: QueryCounter):
-    """Lock in current query count for the per-resource group resolver.
+def test_get_group_permission_for_user_experiment_query_count(
+    alice_with_three_groups: SqlAlchemyStore,
+    query_counter: QueryCounter,
+):
+    """Query count for the per-resource group resolver.
 
-    Tests ``ExperimentPermissionGroupRepository.get_group_permission_for_user_experiment``,
-    which is on the hot path for every protected experiment access.
+    Post-Task-1 JOIN collapse already dropped this from the pre-task-1
+    baseline; no Task 5 change applies here. See quick task 260512-o78.
 
-    baseline 2026-05-12 @ f3ac331 (post-Task-1 JOIN collapse) — see quick task 260512-o78
+    was 9 (pre-Task-1, 2-step user-groups fetch), now 8 (post-Task-1 JOIN)
     """
     alice_with_three_groups.create_group_experiment_permission("g1", "exp-1", "READ")
 
@@ -87,12 +104,7 @@ def test_get_group_permission_for_user_experiment_query_count(alice_with_three_g
     perm = alice_with_three_groups.get_user_groups_experiment_permission("exp-1", "alice")
 
     assert perm.permission == "READ"
-    # baseline 2026-05-12 @ f3ac331 — Post-Task-1, the chain is:
-    #   1 get_user(alice) -> 1 query
-    #   1 JOIN-collapsed _list_user_groups -> 1 query  (was 2 pre-Task-1)
-    #   3 groups × 2 queries (_get_group_permission_or_none does
-    #     SqlGroup lookup + permission lookup) -> 6 queries
-    # Total: 8. See quick task 260512-o78.
+    # was 9 (pre-Task-1), now 8 — quick task 260512-o78
     assert query_counter.total == 8
 
 
@@ -100,23 +112,28 @@ def test_workspace_cache_cold_lookup_query_count(
     alice_with_three_groups: SqlAlchemyStore,
     query_counter: QueryCounter,
     workspaces_enabled: None,
+    reset_user_context_cache: None,
 ):
-    """Lock in current query count for ``get_workspace_permission_cached`` cold path.
+    """Cold workspace lookup with the new context cache pre-fetches everything.
 
-    With workspaces enabled and a user-direct workspace permission seeded,
-    the resolver short-circuits at the first source ("user").
+    The shape changed in Task 5: the resolver now does one full
+    ``build_user_permission_context`` (which when workspaces are on
+    fetches 4 extra branches) and then reads in-process. Single-lookup
+    cold cost rose (3 -> 27) but the entire context is now reusable for
+    all subsequent permission checks in the same 30s window at 0 queries
+    each, so any request that issues 3+ permission checks comes out
+    ahead. See quick task 260512-o78.
 
-    baseline 2026-05-12 @ f3ac331 — see quick task 260512-o78
+    was 3, now 27 — see quick task 260512-o78
     """
     alice_with_three_groups.create_workspace_permission("ws-1", "alice", "READ")
 
     from mlflow_oidc_auth.utils import workspace_cache
 
-    # Force the workspace cache backend to be re-initialized so this test
-    # starts with a clean cache namespace.
-    workspace_cache._cache = None
-
-    with patch("mlflow_oidc_auth.store.store", alice_with_three_groups):
+    with (
+        patch("mlflow_oidc_auth.store.store", alice_with_three_groups),
+        patch("mlflow_oidc_auth.utils.batch_permissions.store", alice_with_three_groups),
+    ):
         workspace_cache.invalidate_workspace_permission("alice", "ws-1")
 
         query_counter.reset()
@@ -124,39 +141,149 @@ def test_workspace_cache_cold_lookup_query_count(
 
     assert result is not None
     assert result.name == "READ"
-    # baseline 2026-05-12 @ f3ac331 — User-direct source is first in the
-    # default PERMISSION_SOURCE_ORDER and resolves in 3 queries
-    # (get_workspace_permission does a workspace+username lookup via JOIN
-    # but the repo internally re-fetches the user). See quick task 260512-o78.
-    assert query_counter.total == 3
+    # was 3, now 27 — full context pre-fetch on first call (see quick task 260512-o78)
+    assert query_counter.total == 27
 
 
 def test_workspace_cache_warm_lookup_query_count(
     alice_with_three_groups: SqlAlchemyStore,
     query_counter: QueryCounter,
     workspaces_enabled: None,
+    reset_user_context_cache: None,
 ):
-    """Lock in current query count for the warm-cache path: the second
-    lookup after a cold lookup with a known permission must be 0 queries.
+    """Warm path: second lookup must be 0 queries.
 
-    baseline 2026-05-12 @ f3ac331 — see quick task 260512-o78
+    Cache-hit on both the workspace cache AND the user_context cache.
+
+    was 0, now 0 — no change. See quick task 260512-o78.
     """
     alice_with_three_groups.create_workspace_permission("ws-1", "alice", "READ")
 
     from mlflow_oidc_auth.utils import workspace_cache
 
-    workspace_cache._cache = None
-
-    with patch("mlflow_oidc_auth.store.store", alice_with_three_groups):
+    with (
+        patch("mlflow_oidc_auth.store.store", alice_with_three_groups),
+        patch("mlflow_oidc_auth.utils.batch_permissions.store", alice_with_three_groups),
+    ):
         workspace_cache.invalidate_workspace_permission("alice", "ws-1")
-        # Cold: populates cache.
         first = workspace_cache.get_workspace_permission_cached("alice", "ws-1")
         assert first is not None
 
         query_counter.reset()
-        # Warm: must hit cache, 0 queries.
         second = workspace_cache.get_workspace_permission_cached("alice", "ws-1")
         assert second is not None
 
-    # baseline 2026-05-12 @ f3ac331 — pure cache hit. See quick task 260512-o78.
+    # was 0, now 0 — see quick task 260512-o78
     assert query_counter.total == 0
+
+
+def test_workspace_cache_second_workspace_warm_via_user_context(
+    alice_with_three_groups: SqlAlchemyStore,
+    query_counter: QueryCounter,
+    workspaces_enabled: None,
+    reset_user_context_cache: None,
+):
+    """Second workspace lookup for the same user should be 0 queries.
+
+    Even though it's a different workspace key (so the workspace_cache
+    misses), the user_context cache HITs and the resolver reads in-process.
+    This is the primary perf win — N permission checks for one user cost
+    O(1) DB after the first build. See quick task 260512-o78.
+    """
+    alice_with_three_groups.create_workspace_permission("ws-1", "alice", "READ")
+    alice_with_three_groups.create_workspace_permission("ws-2", "alice", "EDIT")
+
+    from mlflow_oidc_auth.utils import workspace_cache
+
+    with (
+        patch("mlflow_oidc_auth.store.store", alice_with_three_groups),
+        patch("mlflow_oidc_auth.utils.batch_permissions.store", alice_with_three_groups),
+    ):
+        workspace_cache.invalidate_workspace_permission("alice", "ws-1")
+        workspace_cache.invalidate_workspace_permission("alice", "ws-2")
+        first = workspace_cache.get_workspace_permission_cached("alice", "ws-1")
+        assert first is not None
+
+        # Different workspace, same user: workspace cache misses but
+        # user_context cache hits.
+        query_counter.reset()
+        second = workspace_cache.get_workspace_permission_cached("alice", "ws-2")
+        assert second is not None
+
+    assert query_counter.total == 0
+
+
+def test_resolver_does_not_regress_when_context_missing(
+    alice_with_three_groups: SqlAlchemyStore,
+    query_counter: QueryCounter,
+    workspaces_enabled: None,
+    reset_user_context_cache: None,
+):
+    """Guards against future refactors that accidentally bypass the cache.
+
+    Calls the resolver chain twice in the same simulated request (same
+    username, no intervening mutation) and asserts the second call's
+    query count is 0 (cache-hit path).
+    """
+    alice_with_three_groups.create_workspace_permission("ws-1", "alice", "READ")
+
+    from mlflow_oidc_auth.utils import workspace_cache
+
+    with (
+        patch("mlflow_oidc_auth.store.store", alice_with_three_groups),
+        patch("mlflow_oidc_auth.utils.batch_permissions.store", alice_with_three_groups),
+    ):
+        workspace_cache.invalidate_workspace_permission("alice", "ws-1")
+        workspace_cache.get_workspace_permission_cached("alice", "ws-1")  # cold
+
+        query_counter.reset()
+        # Force a fresh workspace_cache key check by invalidating that one
+        # entry, but leave the user_context cache populated.
+        workspace_cache.invalidate_workspace_permission("alice", "ws-1")
+        workspace_cache.get_workspace_permission_cached("alice", "ws-1")  # context-cache hit
+
+    assert query_counter.total == 0
+
+
+def test_invalidation_via_add_user_to_group_forces_rebuild(
+    alice_with_three_groups: SqlAlchemyStore,
+    query_counter: QueryCounter,
+    workspaces_enabled: None,
+    reset_user_context_cache: None,
+):
+    """Cache invalidation reaches the new user_context cache.
+
+    After a mutation that goes through ``_PERMISSION_CUD_METHODS``
+    (add_user_to_group), the next resolver call must rebuild the context
+    (counter > 0), proving invalidation propagates.
+    """
+    alice_with_three_groups.create_workspace_permission("ws-1", "alice", "READ")
+
+    from mlflow_oidc_auth.utils import workspace_cache
+
+    with (
+        patch("mlflow_oidc_auth.store.store", alice_with_three_groups),
+        patch("mlflow_oidc_auth.utils.batch_permissions.store", alice_with_three_groups),
+    ):
+        workspace_cache.invalidate_workspace_permission("alice", "ws-1")
+        first = workspace_cache.get_workspace_permission_cached("alice", "ws-1")
+        assert first is not None
+
+        # Confirm we're warm.
+        query_counter.reset()
+        workspace_cache.invalidate_workspace_permission("alice", "ws-1")
+        workspace_cache.get_workspace_permission_cached("alice", "ws-1")
+        warm = query_counter.total
+
+        # Mutate -> _PERMISSION_CUD_METHODS wrapper flushes the user_context
+        # cache (via flush_user_context_cache).
+        alice_with_three_groups.populate_groups(["g4"])
+        alice_with_three_groups.add_user_to_group("alice", "g4")
+
+        query_counter.reset()
+        workspace_cache.invalidate_workspace_permission("alice", "ws-1")
+        workspace_cache.get_workspace_permission_cached("alice", "ws-1")
+        after_mutation = query_counter.total
+
+    assert warm == 0, "Sanity check: warm path should be 0 queries"
+    assert after_mutation > 0, "After CUD mutation, the resolver must rebuild the context"
