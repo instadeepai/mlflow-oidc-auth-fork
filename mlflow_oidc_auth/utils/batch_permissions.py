@@ -6,7 +6,7 @@ queries compared to per-item permission lookups.
 """
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 from mlflow.server.handlers import _get_tracking_store
@@ -19,6 +19,8 @@ from mlflow_oidc_auth.entities import (
     RegisteredModelGroupRegexPermission,
     RegisteredModelPermission,
     RegisteredModelRegexPermission,
+    WorkspaceGroupRegexPermission,
+    WorkspaceRegexPermission,
 )
 from mlflow_oidc_auth.logger import get_logger
 from mlflow_oidc_auth.models import PermissionResult
@@ -45,6 +47,16 @@ class UserPermissionContext:
         group_model_regex_permissions: Ordered list of group model regex permissions.
         prompt_regex_permissions: Ordered list of user's prompt regex permissions.
         group_prompt_regex_permissions: Ordered list of group prompt regex permissions.
+        user_workspace_permissions: Dict mapping workspace name to user-direct permission
+            string. Only populated when MLFLOW_ENABLE_WORKSPACES is true (else empty).
+        group_workspace_permissions: Dict mapping workspace name to group-direct permission
+            string (across all groups the user belongs to). Only populated when
+            MLFLOW_ENABLE_WORKSPACES is true.
+        workspace_regex_permissions: Ordered list of user's workspace regex permissions
+            (sorted by priority). Only populated when MLFLOW_ENABLE_WORKSPACES is true.
+        group_workspace_regex_permissions: Ordered list of workspace regex permissions
+            attached to the user's groups. Only populated when MLFLOW_ENABLE_WORKSPACES
+            is true.
     """
 
     username: str
@@ -62,6 +74,14 @@ class UserPermissionContext:
     # Prompt-specific regex permissions
     prompt_regex_permissions: List[RegisteredModelRegexPermission]
     group_prompt_regex_permissions: List[RegisteredModelGroupRegexPermission]
+    # Workspace branch (only populated when MLFLOW_ENABLE_WORKSPACES is true).
+    # Defaults keep existing callers/tests working: when workspaces are off,
+    # these stay empty containers so consumers that read them get the same
+    # behavior as "no permission found".
+    user_workspace_permissions: Optional[Dict[str, str]] = field(default_factory=dict)
+    group_workspace_permissions: Optional[Dict[str, str]] = field(default_factory=dict)
+    workspace_regex_permissions: List[WorkspaceRegexPermission] = field(default_factory=list)
+    group_workspace_regex_permissions: List[WorkspaceGroupRegexPermission] = field(default_factory=list)
 
 
 def build_user_permission_context(username: str) -> UserPermissionContext:
@@ -107,6 +127,27 @@ def build_user_permission_context(username: str) -> UserPermissionContext:
     prompt_regex_permissions = store.list_prompt_regex_permissions(username)
     group_prompt_regex_permissions = store.list_group_prompt_regex_permissions_for_groups_ids(group_ids) if group_ids else []
 
+    # Workspace branch - only populated when MLFLOW_ENABLE_WORKSPACES is true,
+    # to keep cold-path cost identical for non-workspace deployments.
+    user_workspace_permissions: Dict[str, str] = {}
+    group_workspace_permissions: Dict[str, str] = {}
+    workspace_regex_permissions: List[WorkspaceRegexPermission] = []
+    group_workspace_regex_permissions: List[WorkspaceGroupRegexPermission] = []
+    if config.MLFLOW_ENABLE_WORKSPACES:
+        user_ws_perms = store.list_workspace_permissions_for_user(username)
+        user_workspace_permissions = {p.workspace: p.permission for p in user_ws_perms}
+
+        group_ws_perms = store.list_user_groups_workspace_permissions(username)
+        # If multiple groups grant on the same workspace, keep the first
+        # encountered. Resolver-time logic (workspace_cache._resolve_group_direct)
+        # already collapses duplicates by querying for "highest"; the pre-fetch
+        # surfaces all rows but the dict naturally dedupes by workspace.
+        group_workspace_permissions = {p.workspace: p.permission for p in group_ws_perms}
+
+        workspace_regex_permissions = store.list_workspace_regex_permissions(username)
+        if group_ids:
+            group_workspace_regex_permissions = store.list_workspace_group_regex_permissions_for_groups_ids(group_ids)
+
     return UserPermissionContext(
         username=username,
         group_ids=group_ids,
@@ -120,6 +161,10 @@ def build_user_permission_context(username: str) -> UserPermissionContext:
         group_model_regex_permissions=group_model_regex_permissions,
         prompt_regex_permissions=prompt_regex_permissions,
         group_prompt_regex_permissions=group_prompt_regex_permissions,
+        user_workspace_permissions=user_workspace_permissions,
+        group_workspace_permissions=group_workspace_permissions,
+        workspace_regex_permissions=workspace_regex_permissions,
+        group_workspace_regex_permissions=group_workspace_regex_permissions,
     )
 
 

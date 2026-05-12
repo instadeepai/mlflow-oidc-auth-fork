@@ -311,6 +311,103 @@ class TestBuildUserPermissionContext:
         mock_store.list_group_prompt_regex_permissions_for_groups_ids.assert_not_called()
 
 
+class TestBuildUserPermissionContextWorkspaceBranch:
+    """Workspace-branch pre-fetch in ``build_user_permission_context``.
+
+    Added by quick task 260512-o78. The workspace fields are populated only
+    when ``MLFLOW_ENABLE_WORKSPACES`` is true; when it is false, those fields
+    must stay at their empty-container defaults so non-workspace deployments
+    don't pay the extra round-trips.
+    """
+
+    @patch("mlflow_oidc_auth.utils.batch_permissions.config")
+    @patch("mlflow_oidc_auth.utils.batch_permissions.store")
+    def test_workspaces_disabled_leaves_workspace_fields_empty(self, mock_store, mock_config):
+        """When workspaces are off, none of the new store methods are called."""
+        mock_config.MLFLOW_ENABLE_WORKSPACES = False
+        mock_store.get_groups_ids_for_user.return_value = [1, 2]
+        mock_store.list_experiment_permissions.return_value = []
+        mock_store.list_user_groups_experiment_permissions.return_value = []
+        mock_store.list_experiment_regex_permissions.return_value = []
+        mock_store.list_group_experiment_regex_permissions_for_groups_ids.return_value = []
+        mock_store.list_registered_model_permissions.return_value = []
+        mock_store.list_user_groups_registered_model_permissions.return_value = []
+        mock_store.list_registered_model_regex_permissions.return_value = []
+        mock_store.list_group_registered_model_regex_permissions_for_groups_ids.return_value = []
+        mock_store.list_prompt_regex_permissions.return_value = []
+        mock_store.list_group_prompt_regex_permissions_for_groups_ids.return_value = []
+
+        ctx = build_user_permission_context("testuser")
+
+        assert ctx.user_workspace_permissions == {}
+        assert ctx.group_workspace_permissions == {}
+        assert ctx.workspace_regex_permissions == []
+        assert ctx.group_workspace_regex_permissions == []
+        mock_store.list_workspace_permissions_for_user.assert_not_called()
+        mock_store.list_user_groups_workspace_permissions.assert_not_called()
+        mock_store.list_workspace_regex_permissions.assert_not_called()
+        mock_store.list_workspace_group_regex_permissions_for_groups_ids.assert_not_called()
+
+    @patch("mlflow_oidc_auth.utils.batch_permissions.config")
+    @patch("mlflow_oidc_auth.utils.batch_permissions.store")
+    def test_workspaces_enabled_populates_all_four_branches(self, mock_store, mock_config):
+        """All four workspace fields are populated from the new store methods."""
+        mock_config.MLFLOW_ENABLE_WORKSPACES = True
+        mock_store.get_groups_ids_for_user.return_value = [1, 2]
+        mock_store.list_experiment_permissions.return_value = []
+        mock_store.list_user_groups_experiment_permissions.return_value = []
+        mock_store.list_experiment_regex_permissions.return_value = []
+        mock_store.list_group_experiment_regex_permissions_for_groups_ids.return_value = []
+        mock_store.list_registered_model_permissions.return_value = []
+        mock_store.list_user_groups_registered_model_permissions.return_value = []
+        mock_store.list_registered_model_regex_permissions.return_value = []
+        mock_store.list_group_registered_model_regex_permissions_for_groups_ids.return_value = []
+        mock_store.list_prompt_regex_permissions.return_value = []
+        mock_store.list_group_prompt_regex_permissions_for_groups_ids.return_value = []
+
+        user_ws_perm = MagicMock(workspace="ws-1", permission="READ")
+        mock_store.list_workspace_permissions_for_user.return_value = [user_ws_perm]
+        group_ws_perm = MagicMock(workspace="ws-2", permission="EDIT")
+        mock_store.list_user_groups_workspace_permissions.return_value = [group_ws_perm]
+        ws_regex = MagicMock(regex="^ws-.*$", permission="READ", priority=10)
+        mock_store.list_workspace_regex_permissions.return_value = [ws_regex]
+        group_ws_regex = MagicMock(regex="^ws-team-.*$", permission="EDIT", priority=20)
+        mock_store.list_workspace_group_regex_permissions_for_groups_ids.return_value = [group_ws_regex]
+
+        ctx = build_user_permission_context("testuser")
+
+        assert ctx.user_workspace_permissions == {"ws-1": "READ"}
+        assert ctx.group_workspace_permissions == {"ws-2": "EDIT"}
+        assert ctx.workspace_regex_permissions == [ws_regex]
+        assert ctx.group_workspace_regex_permissions == [group_ws_regex]
+        mock_store.list_workspace_permissions_for_user.assert_called_once_with("testuser")
+        mock_store.list_user_groups_workspace_permissions.assert_called_once_with("testuser")
+        mock_store.list_workspace_regex_permissions.assert_called_once_with("testuser")
+        mock_store.list_workspace_group_regex_permissions_for_groups_ids.assert_called_once_with([1, 2])
+
+    @patch("mlflow_oidc_auth.utils.batch_permissions.config")
+    @patch("mlflow_oidc_auth.utils.batch_permissions.store")
+    def test_workspaces_enabled_skips_group_regex_when_user_has_no_groups(self, mock_store, mock_config):
+        """The group-workspace-regex lister is skipped when the user has no groups."""
+        mock_config.MLFLOW_ENABLE_WORKSPACES = True
+        mock_store.get_groups_ids_for_user.return_value = []
+        mock_store.list_experiment_permissions.return_value = []
+        mock_store.list_user_groups_experiment_permissions.return_value = []
+        mock_store.list_experiment_regex_permissions.return_value = []
+        mock_store.list_registered_model_permissions.return_value = []
+        mock_store.list_user_groups_registered_model_permissions.return_value = []
+        mock_store.list_registered_model_regex_permissions.return_value = []
+        mock_store.list_prompt_regex_permissions.return_value = []
+        mock_store.list_workspace_permissions_for_user.return_value = []
+        mock_store.list_user_groups_workspace_permissions.return_value = []
+        mock_store.list_workspace_regex_permissions.return_value = []
+
+        ctx = build_user_permission_context("testuser")
+
+        assert ctx.group_workspace_regex_permissions == []
+        mock_store.list_workspace_group_regex_permissions_for_groups_ids.assert_not_called()
+
+
 class TestResolveExperimentPermissionFromContext:
     """Tests for resolving experiment permissions from context."""
 
