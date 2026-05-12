@@ -978,6 +978,59 @@ class SqlAlchemyStore:
         """List all group permissions in a workspace."""
         return self.workspace_group_permission_repo.list_for_workspace(workspace)
 
+    def list_workspace_permissions_for_user(self, username: str) -> list[WorkspacePermission]:
+        """List all user-direct workspace permissions for a given username.
+
+        Used by ``build_user_permission_context`` to pre-fetch the full
+        user-direct workspace branch in one query. Uses a JOIN on
+        ``users`` to translate username -> user_id, so the read is a
+        single round-trip (no two-step username -> user_id -> permissions
+        anti-pattern).
+
+        :param username: The username to look up.
+        :return: List of WorkspacePermission entities for the user.
+        """
+        from mlflow_oidc_auth.db.models import SqlUser
+        from mlflow_oidc_auth.db.models.workspace import SqlWorkspacePermission
+
+        with self.ManagedSessionMaker() as session:
+            perms = (
+                session.query(SqlWorkspacePermission)
+                .join(SqlUser, SqlWorkspacePermission.user_id == SqlUser.id)
+                .filter(SqlUser.username == username)
+                .all()
+            )
+            return [p.to_mlflow_entity() for p in perms]
+
+    def list_user_groups_workspace_permissions(self, username: str) -> list[WorkspaceGroupPermission]:
+        """List workspace permissions for all groups a user belongs to.
+
+        Used by ``build_user_permission_context`` to pre-fetch the full
+        group-direct workspace branch in one query. JOINs
+        ``workspace_group_permissions`` with ``user_groups`` (and ``users``
+        to resolve the username) so the read is one round-trip regardless
+        of group count.
+
+        :param username: The username whose groups to look up.
+        :return: List of WorkspaceGroupPermission entities across all
+            groups the user belongs to.
+        """
+        from mlflow_oidc_auth.db.models import SqlUser, SqlUserGroup
+        from mlflow_oidc_auth.db.models.workspace import SqlWorkspaceGroupPermission
+
+        with self.ManagedSessionMaker() as session:
+            perms = (
+                session.query(SqlWorkspaceGroupPermission)
+                .join(
+                    SqlUserGroup,
+                    SqlWorkspaceGroupPermission.group_id == SqlUserGroup.group_id,
+                )
+                .join(SqlUser, SqlUserGroup.user_id == SqlUser.id)
+                .filter(SqlUser.username == username)
+                .all()
+            )
+            return [p.to_mlflow_entity() for p in perms]
+
     def wipe_workspace_permissions(self, workspace: str) -> int:
         """Delete all user and group permissions for a workspace.
 

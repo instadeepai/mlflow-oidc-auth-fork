@@ -976,3 +976,103 @@ class TestSqlAlchemyStoreInitialization:
                                 store.init_db(uri)
                                 assert store.db_uri == uri
                                 assert store.db_type == uri.split("://")[0]
+
+
+class TestUserScopedWorkspacePermissionListers:
+    """End-to-end tests for the user-scoped workspace permission listers added
+    in quick task 260512-o78 / Task 4a.
+
+    These listers are used by ``build_user_permission_context`` to pre-fetch
+    the workspace branch in single-query JOINs (no Python-side filtering).
+    Tests use the real in-memory SqlAlchemyStore (not mocks) so the JOIN is
+    actually exercised.
+    """
+
+    @pytest.fixture
+    def real_store(self):
+        from mlflow_oidc_auth.db.models._base import Base
+
+        with patch("mlflow_oidc_auth.sqlalchemy_store.dbutils.migrate_if_needed"):
+            s = SqlAlchemyStore()
+            s.init_db("sqlite:///:memory:")
+            Base.metadata.create_all(s.engine)
+            return s
+
+    def test_list_workspace_permissions_for_user_returns_user_direct_grants(self, real_store):
+        """User's direct workspace grants are returned; other users' aren't."""
+        real_store.create_user(
+            username="alice",
+            password="pw",
+            display_name="Alice",
+            is_admin=False,
+            is_service_account=False,
+        )
+        real_store.create_user(
+            username="bob",
+            password="pw",
+            display_name="Bob",
+            is_admin=False,
+            is_service_account=False,
+        )
+        real_store.create_workspace_permission("ws-1", "alice", "READ")
+        real_store.create_workspace_permission("ws-2", "alice", "EDIT")
+        real_store.create_workspace_permission("ws-3", "bob", "MANAGE")
+
+        perms = real_store.list_workspace_permissions_for_user("alice")
+
+        assert len(perms) == 2
+        by_ws = {p.workspace: p.permission for p in perms}
+        assert by_ws == {"ws-1": "READ", "ws-2": "EDIT"}
+
+    def test_list_workspace_permissions_for_user_returns_empty_when_no_grants(self, real_store):
+        """An empty list is returned (not an exception) when the user has no
+        workspace grants."""
+        real_store.create_user(
+            username="alice",
+            password="pw",
+            display_name="Alice",
+            is_admin=False,
+            is_service_account=False,
+        )
+
+        assert real_store.list_workspace_permissions_for_user("alice") == []
+
+    def test_list_user_groups_workspace_permissions_returns_all_group_grants(self, real_store):
+        """All workspace grants on the user's groups are returned."""
+        real_store.create_user(
+            username="alice",
+            password="pw",
+            display_name="Alice",
+            is_admin=False,
+            is_service_account=False,
+        )
+        real_store.populate_groups(["g1", "g2", "g3"])
+        real_store.add_user_to_group("alice", "g1")
+        real_store.add_user_to_group("alice", "g2")
+        # alice is NOT in g3
+        real_store.create_workspace_group_permission("ws-1", "g1", "READ")
+        real_store.create_workspace_group_permission("ws-2", "g2", "EDIT")
+        real_store.create_workspace_group_permission("ws-3", "g3", "MANAGE")
+
+        perms = real_store.list_user_groups_workspace_permissions("alice")
+
+        by_ws = {p.workspace: p.permission for p in perms}
+        assert by_ws == {"ws-1": "READ", "ws-2": "EDIT"}
+
+    def test_list_user_groups_workspace_permissions_empty_when_no_membership(self, real_store):
+        """An empty list is returned when the user has no group memberships
+        OR when the user's groups have no workspace permissions."""
+        real_store.create_user(
+            username="alice",
+            password="pw",
+            display_name="Alice",
+            is_admin=False,
+            is_service_account=False,
+        )
+        # alice exists but is in no groups.
+        assert real_store.list_user_groups_workspace_permissions("alice") == []
+
+        # Put alice in a group, but give the group no workspace permissions.
+        real_store.populate_groups(["g1"])
+        real_store.add_user_to_group("alice", "g1")
+        assert real_store.list_user_groups_workspace_permissions("alice") == []
