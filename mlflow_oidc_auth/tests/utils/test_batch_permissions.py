@@ -521,6 +521,143 @@ class TestGetOrBuildUserPermissionContext:
         assert mock_build.call_count == 4
 
 
+class TestUserContextCacheInvalidation:
+    """End-to-end cache-invalidation tests against a real in-memory store.
+
+    Added by quick task 260512-o78 / Task 7. For each mutation surface
+    enumerated in CONTEXT.md success criterion 3, we verify that:
+      1. A first build_user_permission_context populates the cache.
+      2. The next call without mutation hits the cache (build not called
+         again).
+      3. After the mutation, the next call rebuilds (build is called).
+
+    These tests exercise the real ``_PERMISSION_CUD_METHODS`` wrapper —
+    not just ``flush_user_context_cache`` in isolation.
+    """
+
+    @pytest.fixture
+    def real_store(self):
+        from mlflow_oidc_auth.db.models._base import Base
+        from mlflow_oidc_auth.sqlalchemy_store import SqlAlchemyStore
+
+        with patch("mlflow_oidc_auth.sqlalchemy_store.dbutils.migrate_if_needed"):
+            s = SqlAlchemyStore()
+            s.init_db("sqlite:///:memory:")
+            Base.metadata.create_all(s.engine)
+            s.create_user(
+                username="alice",
+                password="pw",
+                display_name="Alice",
+                is_admin=False,
+                is_service_account=False,
+            )
+            s.populate_groups(["g1", "g2"])
+            s.add_user_to_group("alice", "g1")
+            return s
+
+    @pytest.fixture(autouse=True)
+    def reset_cache(self):
+        """Each test starts with a clean user_context cache."""
+        import mlflow_oidc_auth.utils.batch_permissions as bp
+
+        bp._user_context_cache = None
+        yield
+        bp._user_context_cache = None
+
+    def _build_count_around_mutation(self, real_store, mutate):
+        """Run the build_count probe: prime cache, then mutate, then verify
+        a third call rebuilds. Returns (warm_call_rebuilt, post_mutation_rebuilt)."""
+        from mlflow_oidc_auth.utils.batch_permissions import (
+            build_user_permission_context,
+            get_or_build_user_permission_context,
+        )
+
+        with patch(
+            "mlflow_oidc_auth.utils.batch_permissions.build_user_permission_context",
+            wraps=build_user_permission_context,
+        ) as wrapped_build:
+            with patch("mlflow_oidc_auth.utils.batch_permissions.store", real_store):
+                get_or_build_user_permission_context("alice")  # 1st build
+                assert wrapped_build.call_count == 1
+                get_or_build_user_permission_context("alice")  # cache hit
+                assert wrapped_build.call_count == 1, "Second call must hit cache"
+
+                # Run the mutation under test.
+                mutate()
+
+                get_or_build_user_permission_context("alice")  # must rebuild
+                return wrapped_build.call_count
+
+    def test_add_user_to_group_invalidates_user_context(self, real_store):
+        """add_user_to_group is in _PERMISSION_CUD_METHODS; flush is wired."""
+        rebuilt = self._build_count_around_mutation(
+            real_store,
+            lambda: real_store.add_user_to_group("alice", "g2"),
+        )
+        assert rebuilt == 2, "add_user_to_group must invalidate user_context cache"
+
+    def test_remove_user_from_group_invalidates_user_context(self, real_store):
+        rebuilt = self._build_count_around_mutation(
+            real_store,
+            lambda: real_store.remove_user_from_group("alice", "g1"),
+        )
+        assert rebuilt == 2, "remove_user_from_group must invalidate user_context cache"
+
+    def test_set_user_groups_invalidates_user_context(self, real_store):
+        rebuilt = self._build_count_around_mutation(
+            real_store,
+            lambda: real_store.set_user_groups("alice", ["g2"]),
+        )
+        assert rebuilt == 2, "set_user_groups must invalidate user_context cache"
+
+    def test_create_workspace_permission_invalidates_user_context(self, real_store):
+        """Workspace user CUD added to _PERMISSION_CUD_METHODS in Task 7."""
+        rebuilt = self._build_count_around_mutation(
+            real_store,
+            lambda: real_store.create_workspace_permission("ws-1", "alice", "READ"),
+        )
+        assert rebuilt == 2, "create_workspace_permission must invalidate user_context cache"
+
+    def test_update_workspace_permission_invalidates_user_context(self, real_store):
+        real_store.create_workspace_permission("ws-1", "alice", "READ")
+        rebuilt = self._build_count_around_mutation(
+            real_store,
+            lambda: real_store.update_workspace_permission("ws-1", "alice", "EDIT"),
+        )
+        assert rebuilt == 2, "update_workspace_permission must invalidate user_context cache"
+
+    def test_delete_workspace_permission_invalidates_user_context(self, real_store):
+        real_store.create_workspace_permission("ws-1", "alice", "READ")
+        rebuilt = self._build_count_around_mutation(
+            real_store,
+            lambda: real_store.delete_workspace_permission("ws-1", "alice"),
+        )
+        assert rebuilt == 2, "delete_workspace_permission must invalidate user_context cache"
+
+    def test_create_workspace_group_permission_invalidates_user_context(self, real_store):
+        """Workspace group CUD added to _PERMISSION_CUD_METHODS in Task 7."""
+        rebuilt = self._build_count_around_mutation(
+            real_store,
+            lambda: real_store.create_workspace_group_permission("ws-1", "g1", "READ"),
+        )
+        assert rebuilt == 2, "create_workspace_group_permission must invalidate user_context cache"
+
+    def test_wipe_workspace_permissions_invalidates_user_context(self, real_store):
+        """wipe_workspace_permissions cascades through both user and group
+        repo deletes. Wrapping the wipe method itself yields one flush per
+        wipe call (not redundant flushes from internal repo calls, since
+        the wipe path calls the repo methods directly, not the wrapped
+        store methods).
+        """
+        real_store.create_workspace_permission("ws-1", "alice", "READ")
+        real_store.create_workspace_group_permission("ws-1", "g1", "READ")
+        rebuilt = self._build_count_around_mutation(
+            real_store,
+            lambda: real_store.wipe_workspace_permissions("ws-1"),
+        )
+        assert rebuilt == 2, "wipe_workspace_permissions must invalidate user_context cache"
+
+
 class TestResolveExperimentPermissionFromContext:
     """Tests for resolving experiment permissions from context."""
 

@@ -1115,11 +1115,15 @@ class SqlAlchemyStore:
 # Permission cache invalidation wiring
 # ---------------------------------------------------------------------------
 # Every permission CUD (create/update/delete/rename/wipe) method listed below
-# will flush the permission resolution cache after successful execution.
-# This ensures callers (routers, hooks, after_request handlers) never serve
-# stale cached permissions.
-# Workspace permission methods are excluded — they have their own dedicated
-# cache (workspace_cache) with invalidation already handled in the router layer.
+# will flush both the permission resolution cache and the user_context cache
+# after successful execution. This ensures callers (routers, hooks,
+# after_request handlers) never serve stale cached permissions.
+# Workspace permission methods are INCLUDED (added in quick task 260512-o78):
+# with the new UserPermissionContext caching the workspace branch, every
+# workspace CUD invalidates the user_context cache. The router layer's
+# invalidate_workspace_permission / flush_workspace_cache calls still run too
+# for the dedicated workspace cache (intentional double-flush; both caches
+# need clearing).
 # User management methods (create_user, update_user, delete_user) are excluded
 # because they don't directly change permission resolution results.
 # set_user_groups IS included because group membership changes affect
@@ -1247,6 +1251,26 @@ _PERMISSION_CUD_METHODS = [
     "set_user_groups",
     "add_user_to_group",
     "remove_user_from_group",
+    # Workspace permissions (user-scoped) - added in quick task 260512-o78.
+    # With the new UserPermissionContext caching the workspace branch, every
+    # workspace mutation must flush user_context (not just the dedicated
+    # workspace cache the router-layer code already invalidates).
+    "create_workspace_permission",
+    "update_workspace_permission",
+    "delete_workspace_permission",
+    "wipe_workspace_permissions",
+    # Workspace permissions (group-scoped)
+    "create_workspace_group_permission",
+    "update_workspace_group_permission",
+    "delete_workspace_group_permission",
+    # Workspace regex permissions (user-scoped)
+    "create_workspace_regex_permission",
+    "update_workspace_regex_permission",
+    "delete_workspace_regex_permission",
+    # Workspace regex permissions (group-scoped)
+    "create_workspace_group_regex_permission",
+    "update_workspace_group_regex_permission",
+    "delete_workspace_group_regex_permission",
 ]
 
 
