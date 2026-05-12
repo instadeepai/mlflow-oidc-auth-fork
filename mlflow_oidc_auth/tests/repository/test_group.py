@@ -125,18 +125,14 @@ def test_remove_user_from_group(repo, session):
 
 def test_list_groups_for_user(repo, session):
     user = MagicMock(id=1)
-    group1 = MagicMock(id=10)
-    group2 = MagicMock(id=20)
-    g1 = MagicMock(group_name="g1")
-    g2 = MagicMock(group_name="g2")
-    session.query().filter().all.return_value = [g1, g2]
-    with (
-        patch("mlflow_oidc_auth.repository.group.get_user", return_value=user),
-        patch(
-            "mlflow_oidc_auth.repository.group.list_user_groups",
-            return_value=[group1, group2],
-        ),
-    ):
+    # After the JOIN collapse, the query chain is:
+    #   session.query(SqlGroup.group_name)
+    #          .join(SqlUserGroup, SqlUserGroup.group_id == SqlGroup.id)
+    #          .filter(SqlUserGroup.user_id == user.id)
+    #          .all()
+    # which returns row tuples [(name,), ...].
+    session.query().join().filter().all.return_value = [("g1",), ("g2",)]
+    with patch("mlflow_oidc_auth.repository.group.get_user", return_value=user):
         assert repo.list_groups_for_user("user") == ["g1", "g2"]
 
 

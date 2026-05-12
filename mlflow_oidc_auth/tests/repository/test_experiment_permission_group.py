@@ -91,24 +91,17 @@ def test__get_experiment_group_permission_database_error(repo, session):
 
 
 @patch("mlflow_oidc_auth.repository._base.get_user")
-@patch("mlflow_oidc_auth.repository._base.list_user_groups")
-def test__list_user_groups(mock_list_user_groups, mock_get_user, repo):
+def test__list_user_groups(mock_get_user, repo):
     session = MagicMock()
     user = make_user()
     mock_get_user.return_value = user
-    group1 = MagicMock(spec=SqlGroup)
-    group1.id = 1
-    group1.group_name = "g1"
-    group2 = MagicMock(spec=SqlGroup)
-    group2.id = 2
-    group2.group_name = "g2"
-    # list_user_groups returns objects with .group_id
-    mock_list_user_groups.return_value = [
-        MagicMock(group_id=1),
-        MagicMock(group_id=2),
-    ]
-    # session.query(SqlGroup).filter(...).all() returns SqlGroup objects
-    session.query().filter().all.return_value = [group1, group2]
+    # After the JOIN collapse, the query chain is:
+    #   session.query(SqlGroup.group_name)
+    #          .join(SqlUserGroup, SqlUserGroup.group_id == SqlGroup.id)
+    #          .filter(SqlUserGroup.user_id == user.id)
+    #          .all()
+    # which returns row tuples [(name,), ...].
+    session.query().join().filter().all.return_value = [("g1",), ("g2",)]
     repo._Session.return_value.__enter__.return_value = session
     result = repo._list_user_groups("user1")
     assert result == ["g1", "g2"]

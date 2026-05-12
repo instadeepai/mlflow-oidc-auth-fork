@@ -18,7 +18,7 @@ from mlflow.protos.databricks_pb2 import (
 from sqlalchemy.exc import IntegrityError, MultipleResultsFound, NoResultFound
 from sqlalchemy.orm import Session
 
-from mlflow_oidc_auth.db.models import SqlGroup, SqlUser
+from mlflow_oidc_auth.db.models import SqlGroup, SqlUser, SqlUserGroup
 from mlflow_oidc_auth.permissions import _validate_permission, compare_permissions
 from mlflow_oidc_auth.repository.utils import (
     get_group,
@@ -251,9 +251,13 @@ class BaseGroupPermissionRepository(Generic[ModelT, EntityT]):
         """
         with self._Session() as session:
             user = get_user(session, username)
-            user_groups_ids = list_user_groups(session, user)
-            user_groups = session.query(SqlGroup).filter(SqlGroup.id.in_([ug.group_id for ug in user_groups_ids])).all()
-            return [ug.group_name for ug in user_groups]
+            rows = (
+                session.query(SqlGroup.group_name)
+                .join(SqlUserGroup, SqlUserGroup.group_id == SqlGroup.id)
+                .filter(SqlUserGroup.user_id == user.id)
+                .all()
+            )
+            return [name for (name,) in rows]
 
     def grant_group_permission(self, group_name: str, resource_id: str, permission: str) -> EntityT:
         """Create a new group permission for a resource.

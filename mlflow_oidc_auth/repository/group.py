@@ -111,9 +111,13 @@ class GroupRepository:
         """
         with self._Session() as session:
             user = get_user(session, username)
-            user_groups_ids = list_user_groups(session, user)
-            user_groups = session.query(SqlGroup).filter(SqlGroup.id.in_([ug.group_id for ug in user_groups_ids])).all()
-            return [ug.group_name for ug in user_groups]
+            rows = (
+                session.query(SqlGroup.group_name)
+                .join(SqlUserGroup, SqlUserGroup.group_id == SqlGroup.id)
+                .filter(SqlUserGroup.user_id == user.id)
+                .all()
+            )
+            return [name for (name,) in rows]
 
     def list_group_ids_for_user(self, username: str) -> List[int]:
         """
