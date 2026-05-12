@@ -143,8 +143,48 @@ class TestGetWorkspacePermissionCached:
             assert mock_lookup.call_count == 2
 
 
+def _make_user_ctx(
+    *,
+    user_workspace=None,
+    group_workspace=None,
+    user_regex=None,
+    group_regex=None,
+):
+    """Build a UserPermissionContext stub with workspace fields populated.
+
+    Non-workspace fields default to the dataclass defaults (empty containers),
+    which is correct for these tests since the resolver only reads the
+    workspace branch.
+    """
+    from mlflow_oidc_auth.utils.batch_permissions import UserPermissionContext
+
+    return UserPermissionContext(
+        username="user1",
+        group_ids=[1] if (group_workspace or group_regex) else [],
+        user_experiment_permissions={},
+        group_experiment_permissions={},
+        experiment_regex_permissions=[],
+        group_experiment_regex_permissions=[],
+        user_model_permissions={},
+        group_model_permissions={},
+        model_regex_permissions=[],
+        group_model_regex_permissions=[],
+        prompt_regex_permissions=[],
+        group_prompt_regex_permissions=[],
+        user_workspace_permissions=user_workspace or {},
+        group_workspace_permissions=group_workspace or {},
+        workspace_regex_permissions=user_regex or [],
+        group_workspace_regex_permissions=group_regex or [],
+    )
+
+
 class TestLookupWorkspacePermission:
-    """Test _lookup_workspace_permission() function."""
+    """Test _lookup_workspace_permission() function.
+
+    Post-quick-task-260512-o78, the resolver reads from a cached
+    ``UserPermissionContext`` instead of issuing per-source DB queries,
+    so these tests stub the context fetch.
+    """
 
     @pytest.fixture(autouse=True)
     def reset_cache(self):
@@ -160,64 +200,85 @@ class TestLookupWorkspacePermission:
         from mlflow_oidc_auth.utils.workspace_cache import _lookup_workspace_permission
 
         mock_config = MagicMock()
-
         mock_config.PERMISSION_SOURCE_ORDER = ["user", "group", "regex", "group-regex"]
 
-        mock_store = MagicMock()
-        mock_perm = MagicMock()
-        mock_perm.permission = "MANAGE"
-        mock_store.get_workspace_permission.return_value = mock_perm
+        ctx = _make_user_ctx(user_workspace={"ws1": "MANAGE"})
 
         with (
             patch("mlflow_oidc_auth.utils.workspace_cache.config", mock_config),
-            patch("mlflow_oidc_auth.store.store", mock_store),
+            patch(
+                "mlflow_oidc_auth.utils.batch_permissions.get_or_build_user_permission_context",
+                return_value=ctx,
+            ),
         ):
             result = _lookup_workspace_permission("user1", "ws1")
             assert result == MANAGE
-            mock_store.get_workspace_permission.assert_called_once_with("ws1", "user1")
 
     def test_falls_through_to_group_permission(self):
-        """_lookup_workspace_permission() tries group-level when user-level fails."""
+        """_lookup_workspace_permission() tries group-level when user-level is missing."""
         from mlflow_oidc_auth.utils.workspace_cache import _lookup_workspace_permission
 
         mock_config = MagicMock()
-
         mock_config.PERMISSION_SOURCE_ORDER = ["user", "group", "regex", "group-regex"]
 
-        mock_store = MagicMock()
-        mock_store.get_workspace_permission.side_effect = MlflowException("Not found", RESOURCE_DOES_NOT_EXIST)
-        mock_group_perm = MagicMock()
-        mock_group_perm.permission = "READ"
-        mock_store.get_user_groups_workspace_permission.return_value = mock_group_perm
+        ctx = _make_user_ctx(group_workspace={"ws1": "READ"})
 
         with (
             patch("mlflow_oidc_auth.utils.workspace_cache.config", mock_config),
-            patch("mlflow_oidc_auth.store.store", mock_store),
+            patch(
+                "mlflow_oidc_auth.utils.batch_permissions.get_or_build_user_permission_context",
+                return_value=ctx,
+            ),
         ):
             result = _lookup_workspace_permission("user1", "ws1")
             assert result == READ
-            mock_store.get_user_groups_workspace_permission.assert_called_once_with("ws1", "user1")
 
     def test_returns_none_when_no_permission(self):
-        """_lookup_workspace_permission() returns None when no user or group permission exists."""
+        """_lookup_workspace_permission() returns None when context has no relevant entries."""
         from mlflow_oidc_auth.utils.workspace_cache import _lookup_workspace_permission
 
         mock_config = MagicMock()
-
         mock_config.PERMISSION_SOURCE_ORDER = ["user", "group", "regex", "group-regex"]
 
-        mock_store = MagicMock()
-        mock_store.get_workspace_permission.side_effect = MlflowException("Not found", RESOURCE_DOES_NOT_EXIST)
-        mock_store.get_user_groups_workspace_permission.side_effect = MlflowException("Not found", RESOURCE_DOES_NOT_EXIST)
-        mock_store.list_workspace_regex_permissions.return_value = []
-        mock_store.get_groups_ids_for_user.return_value = []
+        ctx = _make_user_ctx()  # All workspace branches empty.
+
+        with (
+            patch("mlflow_oidc_auth.utils.workspace_cache.config", mock_config),
+            patch(
+                "mlflow_oidc_auth.utils.batch_permissions.get_or_build_user_permission_context",
+                return_value=ctx,
+            ),
+        ):
+            result = _lookup_workspace_permission("user1", "ws1")
+            assert result is None
+
+    def test_resolver_reads_context_not_store(self):
+        """The resolver must not call any store.* method when the context is provided."""
+        from mlflow_oidc_auth.utils.workspace_cache import _lookup_workspace_permission
+
+        mock_config = MagicMock()
+        mock_config.PERMISSION_SOURCE_ORDER = ["user", "group", "regex", "group-regex"]
+
+        ctx = _make_user_ctx(user_workspace={"ws1": "MANAGE"})
+        mock_store = MagicMock()  # Every attribute access raises on .return_value being unset is fine - we check call_count below.
 
         with (
             patch("mlflow_oidc_auth.utils.workspace_cache.config", mock_config),
             patch("mlflow_oidc_auth.store.store", mock_store),
+            patch(
+                "mlflow_oidc_auth.utils.batch_permissions.get_or_build_user_permission_context",
+                return_value=ctx,
+            ),
         ):
             result = _lookup_workspace_permission("user1", "ws1")
-            assert result is None
+
+        assert result == MANAGE
+        # None of the resolver's old store methods should have been called.
+        mock_store.get_workspace_permission.assert_not_called()
+        mock_store.get_user_groups_workspace_permission.assert_not_called()
+        mock_store.list_workspace_regex_permissions.assert_not_called()
+        mock_store.get_groups_ids_for_user.assert_not_called()
+        mock_store.list_workspace_group_regex_permissions_for_groups_ids.assert_not_called()
 
 
 class TestFlushWorkspaceCache:
@@ -446,7 +507,13 @@ class TestResolveGroupRegex:
 
 
 class TestLookupWithRegexSources:
-    """Integration-level tests for _lookup_workspace_permission() with regex sources."""
+    """Integration-level tests for _lookup_workspace_permission() with regex sources.
+
+    Post-quick-task-260512-o78, the resolver reads regex permissions out of
+    the cached ``UserPermissionContext`` rather than calling the regex
+    listers directly. These tests build a context with the regex branch
+    populated and assert the priority/short-circuit semantics survive.
+    """
 
     @pytest.fixture(autouse=True)
     def reset_cache(self):
@@ -458,101 +525,93 @@ class TestLookupWithRegexSources:
         wc._cache = None
 
     def test_falls_through_to_user_regex(self):
-        """When user-direct and group-direct fail, user-regex matches."""
+        """When user-direct and group-direct are absent, user-regex matches."""
         from mlflow_oidc_auth.utils.workspace_cache import _lookup_workspace_permission
 
         mock_config = MagicMock()
-
         mock_config.PERMISSION_SOURCE_ORDER = ["user", "group", "regex", "group-regex"]
 
-        mock_store = MagicMock()
-        mock_store.get_workspace_permission.side_effect = MlflowException("Not found", RESOURCE_DOES_NOT_EXIST)
-        mock_store.get_user_groups_workspace_permission.side_effect = MlflowException("Not found", RESOURCE_DOES_NOT_EXIST)
         regex_perm = MagicMock()
         regex_perm.regex = "^prod-.*"
         regex_perm.priority = 10
         regex_perm.permission = "EDIT"
-        mock_store.list_workspace_regex_permissions.return_value = [regex_perm]
+        ctx = _make_user_ctx(user_regex=[regex_perm])
 
         with (
             patch("mlflow_oidc_auth.utils.workspace_cache.config", mock_config),
-            patch("mlflow_oidc_auth.store.store", mock_store),
+            patch(
+                "mlflow_oidc_auth.utils.batch_permissions.get_or_build_user_permission_context",
+                return_value=ctx,
+            ),
         ):
             result = _lookup_workspace_permission("user1", "prod-workspace")
             assert result == EDIT
 
     def test_falls_through_to_group_regex(self):
-        """When all direct and user-regex fail, group-regex matches."""
+        """When all earlier sources are empty, group-regex matches."""
         from mlflow_oidc_auth.utils.workspace_cache import _lookup_workspace_permission
 
         mock_config = MagicMock()
-
         mock_config.PERMISSION_SOURCE_ORDER = ["user", "group", "regex", "group-regex"]
 
-        mock_store = MagicMock()
-        mock_store.get_workspace_permission.side_effect = MlflowException("Not found", RESOURCE_DOES_NOT_EXIST)
-        mock_store.get_user_groups_workspace_permission.side_effect = MlflowException("Not found", RESOURCE_DOES_NOT_EXIST)
-        mock_store.list_workspace_regex_permissions.return_value = []
-        mock_store.get_groups_ids_for_user.return_value = [1]
         group_regex_perm = MagicMock()
         group_regex_perm.regex = "^team-.*"
         group_regex_perm.priority = 5
         group_regex_perm.permission = "USE"
-        mock_store.list_workspace_group_regex_permissions_for_groups_ids.return_value = [group_regex_perm]
+        ctx = _make_user_ctx(group_regex=[group_regex_perm])
 
         with (
             patch("mlflow_oidc_auth.utils.workspace_cache.config", mock_config),
-            patch("mlflow_oidc_auth.store.store", mock_store),
+            patch(
+                "mlflow_oidc_auth.utils.batch_permissions.get_or_build_user_permission_context",
+                return_value=ctx,
+            ),
         ):
             result = _lookup_workspace_permission("user1", "team-workspace")
             assert result == USE
 
     def test_respects_custom_source_order(self):
-        """Respects PERMISSION_SOURCE_ORDER — if order is ['regex', 'user'], regex is tried before user-direct."""
+        """When source order puts regex before user, regex wins over user-direct."""
         from mlflow_oidc_auth.utils.workspace_cache import _lookup_workspace_permission
 
         mock_config = MagicMock()
-
         mock_config.PERMISSION_SOURCE_ORDER = ["regex", "user"]
 
-        mock_store = MagicMock()
-        # User-direct would return MANAGE
-        mock_perm = MagicMock()
-        mock_perm.permission = "MANAGE"
-        mock_store.get_workspace_permission.return_value = mock_perm
-        # But regex is first and matches with READ
         regex_perm = MagicMock()
         regex_perm.regex = "^prod-.*"
         regex_perm.priority = 10
         regex_perm.permission = "READ"
-        mock_store.list_workspace_regex_permissions.return_value = [regex_perm]
+        ctx = _make_user_ctx(
+            user_workspace={"prod-workspace": "MANAGE"},
+            user_regex=[regex_perm],
+        )
 
         with (
             patch("mlflow_oidc_auth.utils.workspace_cache.config", mock_config),
-            patch("mlflow_oidc_auth.store.store", mock_store),
+            patch(
+                "mlflow_oidc_auth.utils.batch_permissions.get_or_build_user_permission_context",
+                return_value=ctx,
+            ),
         ):
             result = _lookup_workspace_permission("user1", "prod-workspace")
-            # regex is first in order, so READ wins even though user-direct has MANAGE
+            # regex is first in order, so READ wins even though user-direct has MANAGE.
             assert result == READ
-            # User-direct should NOT have been called because regex matched first
-            mock_store.get_workspace_permission.assert_not_called()
 
     def test_invalid_source_name_skipped(self):
         """Invalid source names are skipped without error."""
         from mlflow_oidc_auth.utils.workspace_cache import _lookup_workspace_permission
 
         mock_config = MagicMock()
-
         mock_config.PERMISSION_SOURCE_ORDER = ["invalid-source", "user"]
 
-        mock_store = MagicMock()
-        mock_perm = MagicMock()
-        mock_perm.permission = "MANAGE"
-        mock_store.get_workspace_permission.return_value = mock_perm
+        ctx = _make_user_ctx(user_workspace={"ws1": "MANAGE"})
 
         with (
             patch("mlflow_oidc_auth.utils.workspace_cache.config", mock_config),
-            patch("mlflow_oidc_auth.store.store", mock_store),
+            patch(
+                "mlflow_oidc_auth.utils.batch_permissions.get_or_build_user_permission_context",
+                return_value=ctx,
+            ),
         ):
             result = _lookup_workspace_permission("user1", "ws1")
             assert result == MANAGE

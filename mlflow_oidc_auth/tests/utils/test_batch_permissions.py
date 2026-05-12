@@ -408,6 +408,119 @@ class TestBuildUserPermissionContextWorkspaceBranch:
         mock_store.list_workspace_group_regex_permissions_for_groups_ids.assert_not_called()
 
 
+class TestGetOrBuildUserPermissionContext:
+    """Tests for the cached helper ``get_or_build_user_permission_context``."""
+
+    @pytest.fixture(autouse=True)
+    def reset_cache(self):
+        """Reset module-level cache between tests so each test starts cold."""
+        import mlflow_oidc_auth.utils.batch_permissions as bp
+
+        bp._user_context_cache = None
+        yield
+        bp._user_context_cache = None
+
+    @patch("mlflow_oidc_auth.utils.batch_permissions.build_user_permission_context")
+    def test_cache_hit_returns_cached_value_without_rebuild(self, mock_build):
+        """Second call must return the cached context and not rebuild."""
+        from mlflow_oidc_auth.utils.batch_permissions import (
+            get_or_build_user_permission_context,
+        )
+
+        sentinel_ctx = MagicMock(spec=UserPermissionContext)
+        mock_build.return_value = sentinel_ctx
+
+        first = get_or_build_user_permission_context("alice")
+        second = get_or_build_user_permission_context("alice")
+
+        assert first is sentinel_ctx
+        assert second is sentinel_ctx
+        # build should be called exactly once across both invocations.
+        assert mock_build.call_count == 1
+
+    @patch("mlflow_oidc_auth.utils.batch_permissions.build_user_permission_context")
+    def test_cache_get_failure_falls_through_to_direct_build(self, mock_build):
+        """If the cache backend raises on get(), we must not propagate.
+
+        The function must fall back to calling build_user_permission_context
+        directly and return the result, logging a warning. Cache errors
+        (e.g., Redis backend in degraded mode) must NEVER prevent
+        permission resolution.
+        """
+        from mlflow_oidc_auth.utils.batch_permissions import (
+            _get_user_context_cache,
+            get_or_build_user_permission_context,
+        )
+
+        # Prime the cache backend, then break its get() method.
+        cache = _get_user_context_cache()
+        sentinel_ctx = MagicMock(spec=UserPermissionContext)
+        mock_build.return_value = sentinel_ctx
+        with patch.object(cache, "get", side_effect=RuntimeError("backend down")):
+            result = get_or_build_user_permission_context("alice")
+
+        assert result is sentinel_ctx
+        mock_build.assert_called_once_with("alice")
+
+    @patch("mlflow_oidc_auth.utils.batch_permissions.build_user_permission_context")
+    def test_cache_set_failure_does_not_propagate(self, mock_build):
+        """If the cache backend raises on set(), the built context is still
+        returned (no caching benefit on this call, but caller is unaffected)."""
+        from mlflow_oidc_auth.utils.batch_permissions import (
+            _get_user_context_cache,
+            get_or_build_user_permission_context,
+        )
+
+        cache = _get_user_context_cache()
+        sentinel_ctx = MagicMock(spec=UserPermissionContext)
+        mock_build.return_value = sentinel_ctx
+        with patch.object(cache, "set", side_effect=RuntimeError("backend down")):
+            result = get_or_build_user_permission_context("alice")
+
+        assert result is sentinel_ctx
+
+    @patch("mlflow_oidc_auth.utils.batch_permissions.build_user_permission_context")
+    def test_flush_user_context_cache_specific_user(self, mock_build):
+        """Flushing a specific username forces a rebuild on the next call."""
+        from mlflow_oidc_auth.utils.batch_permissions import (
+            flush_user_context_cache,
+            get_or_build_user_permission_context,
+        )
+
+        sentinel_ctx = MagicMock(spec=UserPermissionContext)
+        mock_build.return_value = sentinel_ctx
+
+        get_or_build_user_permission_context("alice")
+        get_or_build_user_permission_context("alice")  # warm
+        assert mock_build.call_count == 1
+
+        flush_user_context_cache("alice")
+        get_or_build_user_permission_context("alice")  # cold again
+
+        assert mock_build.call_count == 2
+
+    @patch("mlflow_oidc_auth.utils.batch_permissions.build_user_permission_context")
+    def test_flush_user_context_cache_all_users(self, mock_build):
+        """Flushing without a username clears every user's cache entry."""
+        from mlflow_oidc_auth.utils.batch_permissions import (
+            flush_user_context_cache,
+            get_or_build_user_permission_context,
+        )
+
+        sentinel_ctx = MagicMock(spec=UserPermissionContext)
+        mock_build.return_value = sentinel_ctx
+
+        get_or_build_user_permission_context("alice")
+        get_or_build_user_permission_context("bob")
+        assert mock_build.call_count == 2
+
+        flush_user_context_cache(None)
+
+        get_or_build_user_permission_context("alice")
+        get_or_build_user_permission_context("bob")
+        assert mock_build.call_count == 4
+
+
 class TestResolveExperimentPermissionFromContext:
     """Tests for resolving experiment permissions from context."""
 

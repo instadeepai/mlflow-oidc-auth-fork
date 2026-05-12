@@ -232,7 +232,15 @@ def _resolve_group_regex(store, username: str, workspace: str) -> Permission | N
 
 
 def _lookup_workspace_permission(username: str, workspace: str) -> Permission | None:
-    """Look up workspace permission from DB using configured source resolution order.
+    """Look up workspace permission via the per-user pre-fetched context.
+
+    The four resolution sources (user-direct, group-direct, user-regex,
+    group-regex) all read from the cached ``UserPermissionContext``
+    instead of issuing per-source DB queries. The fetch happens once at
+    the top via ``get_or_build_user_permission_context`` (cached for 30s
+    in the dedicated ``user_context`` namespace); cache invalidation is
+    wired through ``flush_user_context_cache`` from the
+    ``_PERMISSION_CUD_METHODS`` wrapper.
 
     Per D-03: Resolution order respects PERMISSION_SOURCE_ORDER config.
     Per D-04: First match wins (short-circuit).
@@ -245,7 +253,10 @@ def _lookup_workspace_permission(username: str, workspace: str) -> Permission | 
     Returns:
         Permission object or None if no permission found.
     """
-    from mlflow_oidc_auth.store import store  # Lazy import to avoid circular dependency
+    # Lazy import to avoid circular dependency at module load.
+    from mlflow_oidc_auth.utils.batch_permissions import (
+        get_or_build_user_permission_context,
+    )
 
     logger.debug(
         "Looking up workspace permission for %s@%s",
@@ -253,12 +264,33 @@ def _lookup_workspace_permission(username: str, workspace: str) -> Permission | 
         _sanitize(workspace),
     )
 
-    # Build source resolution functions keyed by source name
+    ctx = get_or_build_user_permission_context(username)
+
+    def _from_user_direct() -> Permission | None:
+        perm = ctx.user_workspace_permissions.get(workspace) if ctx.user_workspace_permissions else None
+        return get_permission(perm) if perm is not None else None
+
+    def _from_group_direct() -> Permission | None:
+        perm = ctx.group_workspace_permissions.get(workspace) if ctx.group_workspace_permissions else None
+        return get_permission(perm) if perm is not None else None
+
+    def _from_user_regex() -> Permission | None:
+        if not ctx.workspace_regex_permissions:
+            return None
+        return _match_workspace_regex_permission(ctx.workspace_regex_permissions, workspace)
+
+    def _from_group_regex() -> Permission | None:
+        if not ctx.group_workspace_regex_permissions:
+            return None
+        return _match_workspace_regex_permission(ctx.group_workspace_regex_permissions, workspace)
+
+    # Build source resolution functions keyed by source name. Same keys
+    # and ordering semantics as before; only the fetch changed.
     source_resolvers = {
-        "user": lambda: _resolve_user_direct(store, username, workspace),
-        "group": lambda: _resolve_group_direct(store, username, workspace),
-        "regex": lambda: _resolve_user_regex(store, username, workspace),
-        "group-regex": lambda: _resolve_group_regex(store, username, workspace),
+        "user": _from_user_direct,
+        "group": _from_group_direct,
+        "regex": _from_user_regex,
+        "group-regex": _from_group_regex,
     }
 
     logger.debug("Source order: %s", config.PERMISSION_SOURCE_ORDER)

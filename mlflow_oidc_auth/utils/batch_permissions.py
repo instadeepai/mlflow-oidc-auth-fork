@@ -11,6 +11,7 @@ from typing import Dict, List, Optional
 
 from mlflow.server.handlers import _get_tracking_store
 
+from mlflow_oidc_auth.cache import CacheBackend, get_cache_backend
 from mlflow_oidc_auth.config import config
 from mlflow_oidc_auth.entities import (
     ExperimentGroupRegexPermission,
@@ -28,6 +29,60 @@ from mlflow_oidc_auth.permissions import NO_PERMISSIONS, get_permission
 from mlflow_oidc_auth.store import store
 
 logger = get_logger()
+
+# ---------------------------------------------------------------------------
+# Per-request user permission context cache (dedicated namespace)
+# ---------------------------------------------------------------------------
+# A small dedicated cache (separate from the 'permissions' namespace) for
+# UserPermissionContext objects. Each entry can hold up to ~12 dict/list fields
+# for an admin user across hundreds of resources, so the namespace is capped
+# at 256 entries to bound memory (~25MB worst case) regardless of admin/user
+# spread. TTL=30s matches the 'permissions' namespace so cross-pod staleness
+# windows align.
+
+_USER_CONTEXT_CACHE_MAX_SIZE = 256
+_USER_CONTEXT_CACHE_DEFAULT_TTL = 30
+
+_user_context_cache: Optional[CacheBackend] = None
+
+
+def _get_user_context_cache() -> CacheBackend:
+    """Get or create the user-context cache (lazy init).
+
+    Lazy initialization avoids import-time config reads and lets tests
+    replace the backend by resetting ``_user_context_cache`` to ``None``.
+    """
+    global _user_context_cache
+    if _user_context_cache is None:
+        ttl = getattr(config, "USER_CONTEXT_CACHE_TTL_SECONDS", _USER_CONTEXT_CACHE_DEFAULT_TTL)
+        maxsize = getattr(config, "USER_CONTEXT_CACHE_MAX_SIZE", _USER_CONTEXT_CACHE_MAX_SIZE)
+        _user_context_cache = get_cache_backend("user_context", maxsize=maxsize, ttl=ttl)
+    return _user_context_cache
+
+
+def _user_context_cache_key(username: str) -> str:
+    """Build the cache key for a user's permission context."""
+    return f"user_ctx:{username}"
+
+
+def flush_user_context_cache(username: Optional[str] = None) -> None:
+    """Invalidate cached user permission context(s).
+
+    Called by the permission CUD wrapper in ``sqlalchemy_store`` after any
+    mutation that may change a user's effective permissions. The wrapper
+    does not know which user is affected, so it calls this with
+    ``username=None`` to flush all entries.
+
+    :param username: If provided, only that user's cache entry is removed.
+        If None, the entire user-context cache is cleared.
+    """
+    cache = _get_user_context_cache()
+    if username is None:
+        cache.clear()
+        logger.debug("User context cache fully flushed")
+    else:
+        cache.delete(_user_context_cache_key(username))
+        logger.debug("User context cache invalidated for %s", username)
 
 
 @dataclass
@@ -166,6 +221,51 @@ def build_user_permission_context(username: str) -> UserPermissionContext:
         workspace_regex_permissions=workspace_regex_permissions,
         group_workspace_regex_permissions=group_workspace_regex_permissions,
     )
+
+
+def get_or_build_user_permission_context(username: str) -> UserPermissionContext:
+    """Return the user's permission context, using a per-namespace cache.
+
+    On cache hit, returns the cached context (0 DB queries).
+    On cache miss, builds the context via ``build_user_permission_context``
+    and stores it under ``user_ctx:<username>`` in the ``user_context``
+    cache backend.
+
+    Cache errors (e.g., Redis backend in degraded mode) must NEVER prevent
+    permission resolution; we log a warning and fall through to a direct
+    build. The downstream caller (``workspace_cache._lookup_workspace_permission``,
+    ``batch_resolve_*`` helpers) treats this function as
+    guaranteed-non-raising.
+
+    :param username: The username to fetch context for.
+    :return: A ``UserPermissionContext`` for the user.
+    """
+    cache = _get_user_context_cache()
+    key = _user_context_cache_key(username)
+    try:
+        cached = cache.get(key)
+    except Exception as e:
+        # Cache backend failed (e.g., Redis connection broken). Don't
+        # propagate - permission resolution must still work.
+        logger.warning(
+            "user_context cache get failed for %s (%s); falling back to direct build",
+            username,
+            e,
+        )
+        cached = None
+    if cached is not None:
+        return cached
+
+    ctx = build_user_permission_context(username)
+    try:
+        cache.set(key, ctx)
+    except Exception as e:
+        logger.warning(
+            "user_context cache set failed for %s (%s); proceeding without caching",
+            username,
+            e,
+        )
+    return ctx
 
 
 def _resolve_permission_from_context(
