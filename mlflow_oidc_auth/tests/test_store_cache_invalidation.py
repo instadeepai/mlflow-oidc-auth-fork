@@ -47,6 +47,11 @@ def mock_store():
     store.gateway_model_definition_group_repo = MagicMock()
     store.gateway_model_definition_regex_repo = MagicMock()
     store.gateway_model_definition_group_regex_repo = MagicMock()
+    # Workspace repos (added in quick task 260512-o78).
+    store.workspace_permission_repo = MagicMock()
+    store.workspace_group_permission_repo = MagicMock()
+    store.workspace_regex_permission_repo = MagicMock()
+    store.workspace_group_regex_permission_repo = MagicMock()
     store.ManagedSessionMaker = MagicMock()
     return store
 
@@ -59,10 +64,31 @@ class TestPermissionCUDMethodsList:
         for method_name in _PERMISSION_CUD_METHODS:
             assert hasattr(SqlAlchemyStore, method_name), f"Method {method_name} not found on SqlAlchemyStore"
 
-    def test_no_workspace_methods_included(self):
-        """Workspace methods must NOT be in the list (they have their own cache)."""
-        for method_name in _PERMISSION_CUD_METHODS:
-            assert "workspace" not in method_name, f"Workspace method {method_name} should not be in _PERMISSION_CUD_METHODS"
+    def test_workspace_methods_are_included(self):
+        """Workspace CUD methods MUST be in the list after quick task 260512-o78.
+
+        The UserPermissionContext caches the workspace branch, so every
+        workspace mutation must flush the user_context cache via the
+        wrapper. The dedicated workspace_cache invalidation in the router
+        layer continues to run (intentional double-flush).
+        """
+        required = {
+            "create_workspace_permission",
+            "update_workspace_permission",
+            "delete_workspace_permission",
+            "wipe_workspace_permissions",
+            "create_workspace_group_permission",
+            "update_workspace_group_permission",
+            "delete_workspace_group_permission",
+            "create_workspace_regex_permission",
+            "update_workspace_regex_permission",
+            "delete_workspace_regex_permission",
+            "create_workspace_group_regex_permission",
+            "update_workspace_group_regex_permission",
+            "delete_workspace_group_regex_permission",
+        }
+        missing = required - set(_PERMISSION_CUD_METHODS)
+        assert not missing, f"Workspace methods missing from _PERMISSION_CUD_METHODS: {missing}"
 
     def test_no_user_management_methods_included(self):
         """User CRUD methods (create_user, update_user, delete_user) must NOT be in the list."""
@@ -386,6 +412,20 @@ class TestComprehensiveCUDCoverage:
             "set_user_groups": ("user1", ["group1"]),
             "add_user_to_group": ("user1", "group1"),
             "remove_user_from_group": ("user1", "group1"),
+            # Workspace permissions (added in quick task 260512-o78)
+            "create_workspace_permission": ("ws1", "user1", "READ"),
+            "update_workspace_permission": ("ws1", "user1", "MANAGE"),
+            "delete_workspace_permission": ("ws1", "user1"),
+            "wipe_workspace_permissions": ("ws1",),
+            "create_workspace_group_permission": ("ws1", "group1", "READ"),
+            "update_workspace_group_permission": ("ws1", "group1", "MANAGE"),
+            "delete_workspace_group_permission": ("ws1", "group1"),
+            "create_workspace_regex_permission": (".*", 1, "READ", "user1"),
+            "update_workspace_regex_permission": (".*", 1, "READ", "user1", 1),
+            "delete_workspace_regex_permission": ("user1", 1),
+            "create_workspace_group_regex_permission": ("group1", ".*", 1, "READ"),
+            "update_workspace_group_regex_permission": (1, "group1", ".*", 1, "READ"),
+            "delete_workspace_group_regex_permission": ("group1", 1),
         }
 
         # Verify every method in _PERMISSION_CUD_METHODS has sample args
