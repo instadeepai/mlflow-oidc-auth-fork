@@ -111,12 +111,7 @@ class GroupRepository:
         """
         with self._Session() as session:
             user = get_user(session, username)
-            rows = (
-                session.query(SqlGroup.group_name)
-                .join(SqlUserGroup, SqlUserGroup.group_id == SqlGroup.id)
-                .filter(SqlUserGroup.user_id == user.id)
-                .all()
-            )
+            rows = session.query(SqlGroup.group_name).join(SqlUserGroup, SqlUserGroup.group_id == SqlGroup.id).filter(SqlUserGroup.user_id == user.id).all()
             return [name for (name,) in rows]
 
     def list_group_ids_for_user(self, username: str) -> List[int]:

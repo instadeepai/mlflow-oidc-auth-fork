@@ -994,12 +994,7 @@ class SqlAlchemyStore:
         from mlflow_oidc_auth.db.models.workspace import SqlWorkspacePermission
 
         with self.ManagedSessionMaker() as session:
-            perms = (
-                session.query(SqlWorkspacePermission)
-                .join(SqlUser, SqlWorkspacePermission.user_id == SqlUser.id)
-                .filter(SqlUser.username == username)
-                .all()
-            )
+            perms = session.query(SqlWorkspacePermission).join(SqlUser, SqlWorkspacePermission.user_id == SqlUser.id).filter(SqlUser.username == username).all()
             return [p.to_mlflow_entity() for p in perms]
 
     def list_user_groups_workspace_permissions(self, username: str) -> list[WorkspaceGroupPermission]:
